@@ -1,0 +1,483 @@
+/**
+ * Declarative description of the 13 SRS entities (§4.4 Data Dictionary).
+ * Drives form rendering, input validation, list pages, and RBAC.
+ * Table/column identifiers used in SQL come ONLY from this file — never from
+ * user input — and all values are passed as query parameters.
+ *
+ * Permissions follow the SRS §3.3 permission table (see docs/SRS_AUDIT.md §3).
+ */
+
+export const ROLES = ["Front Desk", "Finance", "Database Administrator"] as const;
+export type Role = (typeof ROLES)[number];
+export const FD: Role = "Front Desk";
+export const FIN: Role = "Finance";
+export const DBA: Role = "Database Administrator";
+const ALL: Role[] = [FD, FIN, DBA];
+
+export const ENUMS = {
+  booking_status: ["Booked", "Checked-In", "Completed", "Cancelled", "No-Show"],
+  pay_type: ["Initial", "Checkout"],
+  charge_type: ["Extension", "Modification"],
+  charge_pay_status: ["Unpaid", "Paid", "Voided"],
+  refund_type: ["Cancellation", "Checkout Credit"],
+  room_type: ["Standard", "Deluxe"],
+  room_view: ["Ocean View", "City View", "Garden View", "Pool View"],
+  pay_method: ["Cash", "Bank", "Card", "Digital Wallet"],
+  discount_type: ["NONE", "12% Discount", "Free Night"],
+  role: ROLES,
+  yes_no: ["Yes", "No"],
+} as const;
+
+export type FieldType = "text" | "email" | "int" | "money" | "date" | "enum" | "ref" | "password";
+
+export interface FieldDef {
+  name: string;
+  label: string;
+  type: FieldType;
+  required?: boolean;
+  max?: number;
+  min?: number;
+  pattern?: RegExp;
+  patternHint?: string;
+  options?: readonly string[];
+  /**
+   * Enum whose values the Database Administrator can extend (SRS Table 26:
+   * room types and views). Options are read from this Postgres enum type;
+   * `options` is only the starting list.
+   */
+  dbEnum?: "room_type_t" | "room_view_t";
+  /** For type "ref": the referenced entity key. */
+  ref?: EntityKey;
+  /** Accept on create (default true). */
+  onCreate?: boolean;
+  /** Accept on update (default true). Primary/foreign keys that define identity are fixed. */
+  onUpdate?: boolean;
+  /** Computed server-side: shown, never accepted from the form. */
+  computed?: boolean;
+  /** Only these roles may set this field (create or update). Others' values are ignored. */
+  writeRoles?: Role[];
+  /** Show in list table (default true). */
+  list?: boolean;
+  /** Offer as a filter dropdown on the list page (enum fields). */
+  filter?: boolean;
+  defaultValue?: string;
+  help?: string;
+  /** Restrict enum options offered on update (business-rule driven). */
+  updateOptions?: readonly string[];
+}
+
+export type Op = "create" | "read" | "update" | "delete";
+
+export interface EntityDef {
+  key: EntityKey;
+  /** AUDIT_TRAIL.AFF_TAB value / SRS table name. */
+  srsName: string;
+  table: string;
+  label: string;
+  plural: string;
+  pk: string;
+  pkType: "int" | "text";
+  /** true → identity column; false → natural key typed by the user. */
+  pkGenerated: boolean;
+  fields: FieldDef[];
+  /** SQL expression (alias t) used as the human label in dropdowns / lists. */
+  labelSql: string;
+  /** Roles allowed per operation through the generic CRUD screens. */
+  perms: Record<Op, Role[]>;
+  /** Front Desk creates these through the booking form, not the generic form. */
+  bookingFlow?: boolean;
+  /** Edits are administrator corrections of logged records (§1.4). */
+  correctionOnly?: boolean;
+}
+
+export const ENTITY_KEYS = [
+  "customer",
+  "loyalty_acc",
+  "room_details",
+  "room",
+  "reservation",
+  "reservation_room",
+  "payment",
+  "receipt",
+  "cancellation",
+  "adjustment_charge",
+  "refund",
+  "staff",
+  "audit_trail",
+] as const;
+export type EntityKey = (typeof ENTITY_KEYS)[number];
+
+const MOBILE = /^\+?[0-9]{7,11}$/;
+const perms = (create: Role[], update: Role[], del: Role[], read: Role[] = ALL): Record<Op, Role[]> => ({
+  create,
+  read,
+  update,
+  delete: del,
+});
+
+export const ENTITIES: Record<EntityKey, EntityDef> = {
+  customer: {
+    key: "customer",
+    srsName: "CUSTOMER",
+    table: "bookinn.customer",
+    label: "Customer",
+    plural: "Customers",
+    pk: "cus_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "t.cus_name || ' <' || t.cus_email || '>'",
+    perms: perms([FD, DBA], [FD, DBA], [DBA]),
+    fields: [
+      { name: "cus_name", label: "Full name", type: "text", required: true, max: 100 },
+      { name: "cus_email", label: "Email", type: "email", required: true, max: 100, help: "Used for receipts." },
+      {
+        name: "cus_mobile",
+        label: "Mobile number",
+        type: "text",
+        required: true,
+        max: 12,
+        pattern: MOBILE,
+        patternHint: "7–11 digits, optional leading +, e.g. 09061234567",
+      },
+    ],
+  },
+  loyalty_acc: {
+    key: "loyalty_acc",
+    srsName: "LOYALTY_ACC",
+    table: "bookinn.loyalty_acc",
+    label: "Loyalty account",
+    plural: "Loyalty accounts",
+    pk: "lyl_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.lyl_id || ' (' || t.total_pts || ' pts)'",
+    perms: perms([FD, DBA], [DBA], [DBA]),
+    fields: [
+      { name: "cus_id", label: "Customer", type: "ref", ref: "customer", required: true, onUpdate: false },
+      {
+        name: "total_pts",
+        label: "Total points",
+        type: "int",
+        min: 0,
+        writeRoles: [DBA],
+        help: "Updated automatically from payments.",
+      },
+    ],
+  },
+  room_details: {
+    key: "room_details",
+    srsName: "ROOM_DETAILS",
+    table: "bookinn.room_details",
+    label: "Room type",
+    plural: "Room types",
+    pk: "room_type_id",
+    pkType: "text",
+    pkGenerated: false,
+    labelSql: "t.room_type_id || ' – ' || t.room_type || ', ' || t.room_view || ' (₱' || t.room_price || ')'",
+    perms: perms([DBA], [DBA], [DBA]),
+    fields: [
+      {
+        name: "room_type_id",
+        label: "Room type ID",
+        type: "text",
+        required: true,
+        max: 4,
+        pattern: /^[A-Z0-9]{1,4}$/,
+        patternHint: "1–4 uppercase letters/digits, e.g. RT03",
+        onUpdate: false,
+      },
+      { name: "room_type", label: "Room type", type: "enum", options: ENUMS.room_type, dbEnum: "room_type_t", required: true, filter: true },
+      {
+        name: "room_price",
+        label: "Price per night (₱)",
+        type: "money",
+        required: true,
+        onUpdate: false,
+        help: "Fixed when the room type is created and never edited. For a different rate, create a new room type.",
+      },
+      { name: "room_view", label: "Room view", type: "enum", options: ENUMS.room_view, dbEnum: "room_view_t", required: true, filter: true },
+    ],
+  },
+  room: {
+    key: "room",
+    srsName: "ROOM",
+    table: "bookinn.room",
+    label: "Room",
+    plural: "Rooms",
+    pk: "room_no",
+    pkType: "int",
+    pkGenerated: false,
+    labelSql:
+      "'Room ' || t.room_no || COALESCE((SELECT ' – ' || d.room_type || ', ' || d.room_view || ' (₱' || d.room_price || '/night)' FROM bookinn.room_details d WHERE d.room_type_id = t.room_type_id), '')",
+    perms: perms([DBA], [DBA], [DBA]),
+    fields: [
+      { name: "room_no", label: "Room number", type: "int", required: true, min: 1, onUpdate: false },
+      {
+        name: "room_type_id",
+        label: "Room type",
+        type: "ref",
+        ref: "room_details",
+        required: true,
+        help: "Cannot be changed once the room has any reservation.",
+      },
+    ],
+  },
+  reservation: {
+    key: "reservation",
+    srsName: "RESERVATION",
+    table: "bookinn.reservation",
+    label: "Reservation",
+    plural: "Reservations",
+    pk: "res_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql:
+      "'#' || t.res_id || ' – ' || COALESCE((SELECT c.cus_name FROM bookinn.customer c WHERE c.cus_id = t.cus_id), '?') || ' (' || t.booking_status || ')'",
+    perms: perms([FD, DBA], [DBA], [DBA]),
+    bookingFlow: true,
+    correctionOnly: true,
+    fields: [
+      { name: "cus_id", label: "Customer", type: "ref", ref: "customer", required: true },
+      {
+        name: "booking_status",
+        label: "Booking status",
+        type: "enum",
+        options: ENUMS.booking_status,
+        onCreate: false,
+        required: true,
+        filter: true,
+        help: "Changed by booking, check-in, check-out, cancellation and the daily job. Corrections are checked against the status rules.",
+      },
+    ],
+  },
+  reservation_room: {
+    key: "reservation_room",
+    srsName: "RESERVATION_ROOM",
+    table: "bookinn.reservation_room",
+    label: "Reserved room",
+    plural: "Reserved rooms",
+    pk: "res_room_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.res_room_id || ' room ' || t.room_no || ' ' || t.check_in_date || ' → ' || t.check_out_date",
+    perms: perms([DBA], [DBA], [DBA]),
+    bookingFlow: true,
+    correctionOnly: true,
+    fields: [
+      { name: "res_id", label: "Reservation", type: "ref", ref: "reservation", required: true, onUpdate: false },
+      { name: "room_no", label: "Room", type: "ref", ref: "room", required: true },
+      { name: "check_in_date", label: "Check-in date", type: "date", required: true },
+      { name: "check_out_date", label: "Check-out date", type: "date", required: true },
+      { name: "actual_check_in", label: "Checked in at", type: "text", computed: true, help: "Recorded by the Check in action (Asia/Manila time)." },
+      { name: "actual_check_out", label: "Checked out at", type: "text", computed: true, help: "Recorded by the Check out action (Asia/Manila time)." },
+    ],
+  },
+  payment: {
+    key: "payment",
+    srsName: "PAYMENT",
+    table: "bookinn.payment",
+    label: "Payment",
+    plural: "Payments",
+    pk: "pay_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.pay_id || ' – ₱' || t.pay_amt || ' (' || t.pay_method || ')'",
+    perms: perms([DBA], [DBA], [DBA]),
+    bookingFlow: true,
+    correctionOnly: true,
+    fields: [
+      { name: "res_id", label: "Reservation", type: "ref", ref: "reservation", required: true, onUpdate: false },
+      {
+        name: "pay_type",
+        label: "Payment type",
+        type: "enum",
+        options: ENUMS.pay_type,
+        required: true,
+        defaultValue: "Initial",
+        onUpdate: false,
+        filter: true,
+        help: "Initial: paid upfront at booking. Checkout: settles the Unpaid charges at check-out.",
+      },
+      { name: "pay_method", label: "Payment method", type: "enum", options: ENUMS.pay_method, required: true, filter: true },
+      { name: "pay_date", label: "Payment date", type: "date", required: true },
+      { name: "pay_amt", label: "Amount paid (₱)", type: "money", required: true },
+      {
+        name: "discount_type",
+        label: "Discount",
+        type: "enum",
+        options: ENUMS.discount_type,
+        required: true,
+        defaultValue: "NONE",
+        filter: true,
+        help: "12% Discount: 100 pts. Free Night: 250 pts.",
+      },
+      { name: "pts_earn", label: "Points earned", type: "int", computed: true },
+      { name: "pts_spend", label: "Points spent", type: "int", computed: true },
+    ],
+  },
+  receipt: {
+    key: "receipt",
+    srsName: "RECEIPT",
+    table: "bookinn.receipt",
+    label: "Receipt",
+    plural: "Receipts",
+    pk: "rct_no",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'Receipt #' || t.rct_no",
+    perms: perms([DBA], [], [DBA]),
+    bookingFlow: true,
+    fields: [{ name: "pay_id", label: "Payment", type: "ref", ref: "payment", required: true, onUpdate: false }],
+  },
+  cancellation: {
+    key: "cancellation",
+    srsName: "CANCELLATION",
+    table: "bookinn.cancellation",
+    label: "Cancellation",
+    plural: "Cancellations",
+    pk: "cancel_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.cancel_id || ' (reservation #' || t.res_id || ')'",
+    perms: perms([FD, DBA], [DBA], [DBA]),
+    fields: [
+      { name: "res_id", label: "Reservation", type: "ref", ref: "reservation", required: true, onUpdate: false },
+      { name: "cancel_date", label: "Cancellation date", type: "date", required: true },
+    ],
+  },
+  adjustment_charge: {
+    key: "adjustment_charge",
+    srsName: "ADJUSTMENT_CHARGE",
+    table: "bookinn.adjustment_charge",
+    label: "Charge",
+    plural: "Charges",
+    pk: "charge_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.charge_id || ' ' || t.charge_type || ' ₱' || t.charge_amt || ' (' || t.pay_status || ')'",
+    // Front Desk posts, settles and voids charges through modification, extension and check-out.
+    perms: perms([DBA], [DBA], [DBA]),
+    bookingFlow: true,
+    correctionOnly: true,
+    fields: [
+      { name: "res_id", label: "Reservation", type: "ref", ref: "reservation", required: true, onUpdate: false },
+      { name: "res_room_id", label: "Reserved room", type: "ref", ref: "reservation_room", onUpdate: false, help: "Extension charges only." },
+      { name: "charge_type", label: "Charge type", type: "enum", options: ENUMS.charge_type, required: true, onUpdate: false, filter: true },
+      { name: "ext_from", label: "Extension from", type: "date", onUpdate: false },
+      { name: "ext_to", label: "Extension to", type: "date", onUpdate: false },
+      { name: "charge_amt", label: "Amount (₱)", type: "money", required: true, onUpdate: false },
+      { name: "pay_status", label: "Payment status", type: "enum", options: ENUMS.charge_pay_status, required: true, defaultValue: "Unpaid", filter: true },
+      { name: "pay_id", label: "Settled by payment", type: "ref", ref: "payment" },
+    ],
+  },
+  refund: {
+    key: "refund",
+    srsName: "REFUND",
+    table: "bookinn.refund",
+    label: "Refund",
+    plural: "Refunds",
+    pk: "refund_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.refund_id || ' ' || t.refund_type || ' ₱' || t.refund_amt",
+    // Front Desk records refunds through cancellation and check-out.
+    perms: perms([DBA], [DBA], [DBA]),
+    bookingFlow: true,
+    correctionOnly: true,
+    fields: [
+      { name: "res_id", label: "Reservation", type: "ref", ref: "reservation", required: true, onUpdate: false },
+      { name: "refund_type", label: "Refund type", type: "enum", options: ENUMS.refund_type, required: true, filter: true },
+      { name: "refund_amt", label: "Amount refunded (₱)", type: "money", required: true },
+      { name: "refund_date", label: "Refund date", type: "date", required: true },
+    ],
+  },
+  staff: {
+    key: "staff",
+    srsName: "STAFF",
+    table: "bookinn.staff",
+    label: "Staff account",
+    plural: "Staff",
+    pk: "staff_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "t.name || ' (' || t.u_name || ')'",
+    perms: perms([DBA], [DBA], [DBA], [DBA]),
+    fields: [
+      {
+        name: "u_name",
+        label: "Username",
+        type: "text",
+        required: true,
+        max: 30,
+        pattern: /^[A-Za-z0-9._-]{3,30}$/,
+        patternHint: "3–30 letters, digits, dot, dash or underscore",
+      },
+      { name: "name", label: "Full name", type: "text", required: true, max: 100 },
+      { name: "role", label: "Role", type: "enum", options: ENUMS.role, required: true, filter: true },
+      {
+        name: "pass",
+        label: "Password",
+        type: "password",
+        required: true,
+        list: false,
+        help: "8+ characters with upper and lower case, a number and a symbol.",
+      },
+      {
+        name: "is_active",
+        label: "Active",
+        type: "enum",
+        options: ENUMS.yes_no,
+        required: true,
+        defaultValue: "Yes",
+        filter: true,
+        help: "Inactive accounts cannot sign in.",
+      },
+    ],
+  },
+  audit_trail: {
+    key: "audit_trail",
+    srsName: "AUDIT_TRAIL",
+    table: "bookinn.audit_trail",
+    label: "Audit entry",
+    plural: "Audit trail",
+    pk: "audit_id",
+    pkType: "int",
+    pkGenerated: true,
+    labelSql: "'#' || t.audit_id",
+    perms: perms([], [], [], [DBA]),
+    fields: [
+      { name: "staff_id", label: "Staff", type: "ref", ref: "staff" },
+      { name: "action", label: "Action", type: "enum", options: ["INSERT", "UPDATE", "DELETE"], filter: true },
+      {
+        name: "aff_tab",
+        label: "Table",
+        type: "enum",
+        options: ENTITY_KEYS.filter((k) => k !== "audit_trail").map((k) => k.toUpperCase()),
+        filter: true,
+      },
+      { name: "rec_id", label: "Record ID", type: "text" },
+      { name: "timestamp", label: "Timestamp", type: "text" },
+      { name: "old_data", label: "Old data", type: "text" },
+      { name: "new_data", label: "New data", type: "text" },
+    ],
+  },
+};
+
+export function isEntityKey(k: string): k is EntityKey {
+  return (ENTITY_KEYS as readonly string[]).includes(k);
+}
+
+export function can(role: Role, e: EntityDef, op: Op) {
+  return e.perms[op].includes(role);
+}
+export const canRead = (role: Role, e: EntityDef) => can(role, e, "read");
+
+/** Fields this role may set when creating/updating (writeRoles, computed and immutability respected). */
+export function writableFields(e: EntityDef, role: Role, mode: "create" | "update") {
+  return e.fields.filter(
+    (f) =>
+      !f.computed &&
+      (mode === "create" ? f.onCreate !== false : f.onUpdate !== false) &&
+      (!f.writeRoles || f.writeRoles.includes(role)),
+  );
+}
